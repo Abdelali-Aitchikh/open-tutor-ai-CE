@@ -18,6 +18,7 @@
 	import { config, models, settings, temporaryChatEnabled, TTSWorker, user } from '$lib/stores';
 	import { synthesizeOpenAISpeech } from '$lib/apis/audio';
 	import { imageGenerations } from '$lib/apis/images';
+	import { readR2VStream, startR2VStream } from '$lib/apis/r2v';
 	import {
 		copyToClipboard as _copyToClipboard,
 		approximateToHumanReadable,
@@ -94,7 +95,11 @@
 			load_duration?: number;
 			usage?: unknown;
 		};
-		annotation?: { type: string; rating: number };
+		annotation?: { type: string; rating: number; tags?: string[] };
+		selectedModelId?: string;
+		parentId?: string;
+		arena?: boolean;
+		feedbackId?: string;
 	}
 
 	export let chatId = '';
@@ -144,6 +149,7 @@
 
 	let loadingSpeech = false;
 	let generatingImage = false;
+	let generatingR2V = false;
 
 	let showRateComment = false;
 
@@ -382,6 +388,197 @@
 		}
 
 		generatingImage = false;
+	};
+
+	const buildR2VStatusMarkdown = (lines: string[]) => {
+		return `### R2V Status\n\n${lines.join('\n')}`;
+	};
+
+	const getErrorMessage = (error: unknown) => {
+		if (error instanceof Error) {
+			return error.message;
+		}
+		if (typeof error === 'object' && error !== null) {
+			const maybeMessage = (error as { message?: unknown; detail?: unknown }).message;
+			if (typeof maybeMessage === 'string' && maybeMessage.trim().length > 0) {
+				return maybeMessage;
+			}
+			const maybeDetail = (error as { detail?: unknown }).detail;
+			if (typeof maybeDetail === 'string' && maybeDetail.trim().length > 0) {
+				return maybeDetail;
+			}
+		}
+		if (typeof error === 'string') {
+			return error;
+		}
+		try {
+			const serialized = JSON.stringify(error);
+			return serialized && serialized !== '{}' ? serialized : 'Unknown error';
+		} catch {
+			return 'Unknown error';
+		}
+	};
+
+	const generateReasoningVideoFromMessage = async () => {
+		console.log('[R2V UI] generateReasoningVideoFromMessage clicked', {
+			messageId: message?.id,
+			chatId,
+			model: message?.model,
+			done: message?.done,
+			contentPreview: message?.content?.slice(0, 150)
+		});
+
+		if (generatingR2V) {
+			console.log('[R2V UI] generation already running for this message, skipping duplicate click');
+			return;
+		}
+
+		if (!message?.content || !message.content.trim()) {
+			toast.error($i18n.t('No assistant content available for R2V generation.'));
+			console.error('[R2V UI] Empty message content, cannot start R2V');
+			return;
+		}
+
+		const originalContent = message.content;
+		const statusLines: string[] = [
+			'- Button clicked.',
+			'- Request preparation in progress...'
+		];
+
+		const applyLiveContent = async (content: string, { done = false } = {}) => {
+			console.log('[R2V UI] applyLiveContent', {
+				messageId: message.id,
+				done,
+				contentPreview: content.slice(0, 120)
+			});
+
+			message = {
+				...message,
+				content,
+				done,
+				error: undefined
+			};
+
+			let persisted = true;
+			try {
+				await saveMessage(message.id, message);
+			} catch (applyError) {
+				persisted = false;
+				console.error('[R2V UI] applyLiveContent saveMessage failed', applyError);
+			}
+
+			await tick();
+			return persisted;
+		};
+
+		try {
+			generatingR2V = true;
+			await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: false });
+
+			let response: Response;
+			try {
+				console.log('[R2V UI] opening SSE stream via API helper');
+				response = await startR2VStream(localStorage.token, {
+					question: originalContent,
+					chat_id: chatId,
+					language: $i18n?.language ?? 'fr',
+					duration_sec: 35
+				});
+				statusLines.push('- SSE stream opened successfully.');
+				await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: false });
+			} catch (requestError) {
+				console.error('[R2V UI] Failed to open SSE stream', requestError);
+				statusLines.push(`- Stream open error: ${getErrorMessage(requestError)}`);
+				statusLines.push('- Tip: check backend availability on port 8080 and authentication token.');
+				await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: true });
+				toast.error($i18n.t('Unable to start R2V stream.'));
+				return;
+			}
+
+			let finalMarkdown = '';
+			let streamFailed = false;
+
+			try {
+				for await (const evt of readR2VStream(response)) {
+					console.log('[R2V UI] SSE event received', evt);
+
+					if (evt.event === 'done') {
+						statusLines.push('- Stream done event received.');
+						continue;
+					}
+
+					if (evt.event === 'progress') {
+						const line = evt?.data?.message ?? 'Progress update received.';
+						statusLines.push(`- ${line}`);
+						await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: false });
+						continue;
+					}
+
+					if (evt.event === 'artifact') {
+						const artifactType = evt?.data?.artifact_type ?? 'unknown';
+						statusLines.push(`- Artifact generated: ${artifactType}`);
+						await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: false });
+						continue;
+					}
+
+					if (evt.event === 'final') {
+						finalMarkdown = evt?.data?.markdown ?? '';
+						statusLines.push('- Final video payload received.');
+						if (finalMarkdown) {
+							await applyLiveContent(finalMarkdown, { done: true });
+						} else {
+							await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: false });
+						}
+						continue;
+					}
+
+					if (evt.event === 'error') {
+						streamFailed = true;
+						const detail = evt?.data?.detail ?? evt?.data?.message ?? 'Unknown R2V backend error.';
+						console.error('[R2V UI] Backend emitted error event', detail);
+						statusLines.push(`- Backend error: ${detail}`);
+						await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: true });
+						toast.error($i18n.t('R2V generation failed.'));
+						break;
+					}
+
+					statusLines.push(`- Unhandled event type: ${evt.event}`);
+					await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: false });
+				}
+			} catch (streamError) {
+				streamFailed = true;
+				console.error('[R2V UI] SSE stream processing failed', streamError);
+				statusLines.push(`- Stream processing error: ${getErrorMessage(streamError)}`);
+				await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: true });
+				toast.error($i18n.t('R2V stream interrupted.'));
+			}
+
+			if (!streamFailed && !finalMarkdown) {
+				statusLines.push('- Stream ended without final markdown payload.');
+				await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: true });
+			}
+		} catch (fatalError) {
+			console.error('[R2V UI] Fatal error in generateReasoningVideoFromMessage', fatalError);
+			const fatalMessage = getErrorMessage(fatalError);
+			toast.error($i18n.t('Unexpected R2V error.') + ` ${fatalMessage}`);
+			try {
+				message = {
+					...message,
+					content: `${buildR2VStatusMarkdown(statusLines)}\n\n- Fatal error: ${fatalMessage}`,
+					done: true,
+					error: { content: fatalMessage }
+				};
+				await tick();
+			} catch (secondaryError) {
+				console.error('[R2V UI] Failed while applying fatal error fallback content', secondaryError);
+			}
+		} finally {
+			generatingR2V = false;
+			console.log('[R2V UI] generateReasoningVideoFromMessage finished', {
+				messageId: message?.id,
+				generatingR2V
+			});
+		}
 	};
 
 	let feedbackLoading = false;
@@ -1206,6 +1403,42 @@
 										</Tooltip>
 									{/if}
 -->
+									<Tooltip content={$i18n.t('Generate Reasoning Video (R2V)')} placement="bottom">
+										<button
+											type="button"
+											class="{isLastMessage
+												? 'visible'
+												: 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition r2v-generate-button disabled:opacity-50 disabled:cursor-progress"
+											disabled={generatingR2V}
+											on:click={async () => {
+												console.log('[R2V UI] Action bar button clicked', {
+													messageId: message.id,
+													chatId
+												});
+												await generateReasoningVideoFromMessage();
+											}}
+										>
+											{#if generatingR2V}
+												<Spinner className="size-4" />
+											{:else}
+												<svg
+													xmlns="http://www.w3.org/2000/svg"
+													fill="none"
+													viewBox="0 0 24 24"
+													stroke-width="2.2"
+													stroke="currentColor"
+													class="w-4 h-4"
+												>
+													<path
+														stroke-linecap="round"
+														stroke-linejoin="round"
+														d="M15.75 10.5V6.108c0-1.135-1.232-1.843-2.213-1.272l-7.242 4.216c-.963.56-.963 1.984 0 2.544l7.242 4.216c.98.57 2.213-.137 2.213-1.272V10.5Zm0 0h5.25m0 0-2.25-2.25M21 10.5l-2.25 2.25"
+													/>
+												</svg>
+											{/if}
+										</button>
+									</Tooltip>
+
 									<Tooltip content={$i18n.t('Regenerate')} placement="bottom">
 										<button
 											type="button"

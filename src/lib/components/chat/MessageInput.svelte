@@ -56,13 +56,15 @@
 	export let imageGenerationEnabled = false;
 	export let webSearchEnabled = false;
 	export let codeInterpreterEnabled = false;
+	export let reasoningVideoEnabled = false;
 
 	$: onChange({
 		prompt,
 		files,
 		selectedToolIds,
 		imageGenerationEnabled,
-		webSearchEnabled
+		webSearchEnabled,
+		reasoningVideoEnabled
 	});
 
 	let loaded = false;
@@ -820,6 +822,7 @@
 															selectedToolIds = [];
 															webSearchEnabled = false;
 															imageGenerationEnabled = false;
+															reasoningVideoEnabled = false;
 														}
 													}}
 													on:paste={async (e) => {
@@ -1011,6 +1014,7 @@
 														selectedToolIds = [];
 														webSearchEnabled = false;
 														imageGenerationEnabled = false;
+														reasoningVideoEnabled = false;
 													}
 												}}
 												rows="1"

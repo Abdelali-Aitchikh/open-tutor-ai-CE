@@ -1,8 +1,10 @@
 import os
+from pathlib import Path
 os.environ["SUPPRESS_WEBUI_BANNER"] = "true"
 import open_tutorai.patches
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from open_webui.main import app as webui_app
 from open_webui.config import CORS_ALLOW_ORIGIN
 from open_webui.models.users import Users
@@ -12,7 +14,8 @@ from open_tutorai.models.database import init_database
 from open_tutorai.routers import (
     response_feedbacks,
     auths,
-    supports
+    supports,
+    r2v
 )
 
 from open_tutorai.env import (
@@ -83,6 +86,16 @@ async def health_check():
 app.include_router(response_feedbacks.router, prefix="/api/v1", tags=["response-feedbacks"])
 app.include_router(auths.router, prefix="/auths", tags=["auths"])
 app.include_router(supports.router, prefix="/api/v1", tags=["supports"])
+app.include_router(r2v.router, prefix="/api/v1/r2v", tags=["r2v"])
+
+# Serve generated R2V media files from backend DATA_DIR over HTTP.
+r2v_media_dir = Path(os.environ.get("DATA_DIR", str(Path(__file__).resolve().parents[1] / "data"))) / "r2v"
+r2v_media_dir.mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/api/v1/r2v/media",
+    StaticFiles(directory=str(r2v_media_dir)),
+    name="r2v_media",
+)
 
 @app.get("/api/changelog")
 async def get_app_changelog():

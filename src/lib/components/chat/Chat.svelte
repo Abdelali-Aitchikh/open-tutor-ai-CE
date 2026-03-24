@@ -12,7 +12,7 @@
 
 	import { get, type Unsubscriber, type Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
-	import { TUTOR_BASE_URL } from '$lib/constants';
+	import { TUTOR_API_BASE_URL, TUTOR_BASE_URL } from '$lib/constants';
 
 	import {
 		chatId,
@@ -120,6 +120,7 @@
 	let imageGenerationEnabled = false;
 	let webSearchEnabled = false;
 	let codeInterpreterEnabled = false;
+	let reasoningVideoEnabled = false;
 	let chat = null;
 	let tags = [];
 
@@ -1291,7 +1292,7 @@
 			toast.error($i18n.t('Please enter a prompt'));
 			return;
 		}
-		if (selectedModels.includes('')) {
+		if (!reasoningVideoEnabled && selectedModels.includes('')) {
 			toast.error($i18n.t('Model not selected'));
 			return;
 		}
@@ -1376,7 +1377,196 @@
 
 		saveSessionSelectedModels();
 
+		if (reasoningVideoEnabled) {
+			await sendR2VPrompt(history, userPrompt, userMessageId, { newChat: true });
+			return;
+		}
+
 		await sendPrompt(history, userPrompt, userMessageId, { newChat: true });
+	};
+
+	const sendR2VPrompt = async (
+		_history,
+		userPrompt: string,
+		parentId: string,
+		{ newChat = false } = {}
+	) => {
+		let _chatId = JSON.parse(JSON.stringify($chatId));
+		_history = JSON.parse(JSON.stringify(_history));
+
+		const responseMessageId = uuidv4();
+		const responseMessage = {
+			parentId,
+			id: responseMessageId,
+			childrenIds: [],
+			role: 'assistant',
+			content: '### R2V Pipeline\n\n- Initialisation...',
+			done: false,
+			model: 'r2v-pipeline',
+			modelName: 'Reasoning-to-Video',
+			modelIdx: 0,
+			timestamp: Math.floor(Date.now() / 1000)
+		};
+
+		history.messages[responseMessageId] = responseMessage;
+		history.currentId = responseMessageId;
+
+		if (parentId && history.messages[parentId]) {
+			history.messages[parentId].childrenIds = [
+				...history.messages[parentId].childrenIds,
+				responseMessageId
+			];
+		}
+
+		if (newChat && _history.messages[_history.currentId].parentId === null) {
+			_chatId = await initChatHandler(_history);
+		}
+
+		await saveChatHandler(_chatId, JSON.parse(JSON.stringify(history)));
+		await tick();
+		scrollToBottom();
+
+		const progressLines: string[] = [];
+
+		const updateProgress = async (line: string) => {
+			progressLines.push(`- ${line}`);
+			responseMessage.content = `### R2V Pipeline\n\n${progressLines.join('\n')}`;
+			history.messages[responseMessageId] = responseMessage;
+			history.currentId = responseMessageId;
+			await tick();
+			if (autoScroll) {
+				scrollToBottom();
+			}
+		};
+
+		const applyFinalMarkdown = async (markdown: string) => {
+			responseMessage.content = markdown;
+			responseMessage.done = true;
+			history.messages[responseMessageId] = responseMessage;
+			history.currentId = responseMessageId;
+			await saveChatHandler(_chatId, JSON.parse(JSON.stringify(history)));
+			await tick();
+			if (autoScroll) {
+				scrollToBottom();
+			}
+		};
+
+		const processSSEBlock = async (rawBlock: string) => {
+			const lines = rawBlock.split('\n');
+			let eventName = 'message';
+			const dataLines: string[] = [];
+
+			for (const line of lines) {
+				if (line.startsWith('event:')) {
+					eventName = line.slice(6).trim();
+				} else if (line.startsWith('data:')) {
+					dataLines.push(line.slice(5).trimStart());
+				}
+			}
+
+			const rawData = dataLines.join('\n');
+			if (!rawData || rawData === '[DONE]') {
+				return;
+			}
+
+			let parsed = null;
+			try {
+				parsed = JSON.parse(rawData);
+			} catch (error) {
+				await updateProgress(rawData);
+				return;
+			}
+
+			if (eventName === 'progress') {
+				await updateProgress(parsed?.message ?? 'Traitement en cours...');
+				return;
+			}
+
+			if (eventName === 'artifact') {
+				await updateProgress(parsed?.message ?? 'Artefact genere.');
+				return;
+			}
+
+			if (eventName === 'final') {
+				await applyFinalMarkdown(parsed?.markdown ?? 'Video generee.');
+				return;
+			}
+
+			if (eventName === 'error') {
+				throw new Error(parsed?.detail ?? parsed?.message ?? 'R2V pipeline error');
+			}
+		};
+
+		try {
+			const res = await fetch(`${TUTOR_API_BASE_URL}/r2v/generate`, {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${localStorage.token}`,
+					'Content-Type': 'application/json'
+				},
+				body: JSON.stringify({
+					question: userPrompt,
+					chat_id: _chatId,
+					language: $i18n?.language ?? 'fr'
+				})
+			});
+
+			if (!res.ok || !res.body) {
+				const detail = await res.text().catch(() => 'Unable to read error response');
+				throw new Error(`R2V request failed (${res.status}): ${detail}`);
+			}
+
+			const reader = res.body.getReader();
+			const decoder = new TextDecoder('utf-8');
+			let buffer = '';
+
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) {
+					break;
+				}
+
+				buffer += decoder.decode(value, { stream: true }).replaceAll('\r\n', '\n');
+				let blockSeparatorIndex = buffer.indexOf('\n\n');
+
+				while (blockSeparatorIndex !== -1) {
+					const rawBlock = buffer.slice(0, blockSeparatorIndex);
+					buffer = buffer.slice(blockSeparatorIndex + 2);
+					await processSSEBlock(rawBlock);
+					blockSeparatorIndex = buffer.indexOf('\n\n');
+				}
+			}
+
+			if (buffer.trim().length > 0) {
+				await processSSEBlock(buffer.trim());
+			}
+		} catch (error) {
+			console.error('R2V streaming error:', error);
+			responseMessage.error = { content: error?.message ?? `${error}` };
+			responseMessage.done = true;
+			responseMessage.content =
+				responseMessage.content +
+				`\n\n> Erreur R2V: ${error?.message ?? 'Echec de generation de la video.'}`;
+			history.messages[responseMessageId] = responseMessage;
+			history.currentId = responseMessageId;
+			await saveChatHandler(_chatId, JSON.parse(JSON.stringify(history)));
+			toast.error($i18n.t('Failed to generate reasoning video.'));
+		} finally {
+			if (!responseMessage.done) {
+				responseMessage.done = true;
+				history.messages[responseMessageId] = responseMessage;
+				history.currentId = responseMessageId;
+				await saveChatHandler(_chatId, JSON.parse(JSON.stringify(history)));
+			}
+
+			await tick();
+			if (autoScroll) {
+				scrollToBottom();
+			}
+		}
+
+		currentChatPage.set(1);
+		chats.set(await getChatList(localStorage.token, $currentChatPage));
 	};
 
 	const sendPrompt = async (
@@ -2323,6 +2513,7 @@
 										bind:imageGenerationEnabled
 										bind:codeInterpreterEnabled
 										bind:webSearchEnabled
+										bind:reasoningVideoEnabled
 										bind:atSelectedModel
 										transparentBackground={true}
 										{stopResponse}
@@ -2382,6 +2573,7 @@
 										bind:imageGenerationEnabled
 										bind:codeInterpreterEnabled
 										bind:webSearchEnabled
+										bind:reasoningVideoEnabled
 										bind:atSelectedModel
 										transparentBackground={$settings?.backgroundImageUrl ?? false}
 										{stopResponse}
