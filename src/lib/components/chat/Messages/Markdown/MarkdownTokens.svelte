@@ -256,11 +256,17 @@
 			</div>
 		</Collapsible>
 	{:else if token.type === 'html'}
-		{@const html = DOMPurify.sanitize(token.text)}
-		{#if html && html.includes('<video')}
-			{@html html}
+		{#if token.text.includes('<video')}
+			<!-- Video tags: sanitize with explicit allowlist for video element and attributes -->
+			{@const videoHtml = DOMPurify.sanitize(token.text, {
+				ADD_TAGS: ['video'],
+				ADD_ATTR: ['src', 'controls', 'preload', 'class', 'crossorigin']
+			})}
+			{@html videoHtml}
 		{:else if token.text.includes(`<iframe src="${TUTOR_BASE_URL}/api/v1/files/`)}
 			{@html `${token.text}`}
+		{:else if token.text.match(/^<\/?(video|iframe)[^>]*>$/i)}
+			<!-- Orphan opening/closing tags for video/iframe: hide them -->
 		{:else}
 			{token.text}
 		{/if}
