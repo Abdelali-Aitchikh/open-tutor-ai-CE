@@ -482,7 +482,8 @@
 					question: originalContent,
 					chat_id: chatId,
 					language: $i18n?.language ?? 'fr',
-					duration_sec: 35
+					duration_sec: 35,
+					model_id: message?.selectedModelId ?? message.model
 				});
 				statusLines.push('- SSE stream opened successfully.');
 				await applyLiveContent(buildR2VStatusMarkdown(statusLines), { done: false });

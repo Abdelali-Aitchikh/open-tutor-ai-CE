@@ -5,6 +5,7 @@ export type R2VRequestPayload = {
 	chat_id?: string;
 	language?: string;
 	duration_sec?: number;
+	model_id?: string;
 };
 
 export type R2VStreamEvent = {
