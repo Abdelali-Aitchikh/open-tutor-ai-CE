@@ -6,12 +6,10 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import time
 import uuid
-import re
-import textwrap
+import queue
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
@@ -24,9 +22,14 @@ from open_webui.models.files import FileForm, Files
 from open_webui.utils.auth import get_verified_user
 from open_webui.config import UPLOAD_DIR as OPENWEBUI_UPLOAD_DIR
 
-# R2V Services (Only LLM is needed now)
+# R2V Services (Configuration LLM)
 from open_tutorai.services.r2v_llm_service import LLMClient
 from open_tutorai.r2v_config.r2v_config import get_r2v_config
+
+# 📦 IMPORT DE LA NOUVELLE ARCHITECTURE MANIM (Le dossier r2v_engine)
+from open_tutorai.services.r2v_engine.orchestrator import ManimPipelineOrchestrator
+from dotenv import load_dotenv
+load_dotenv()
 
 # =============================================================================
 # LOGGING CONFIGURATION
@@ -59,57 +62,6 @@ def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 # =============================================================================
-# SYSTEM PROMPTS
-# =============================================================================
-def _build_module_1_system_prompt() -> str:
-    return """You are Module-1 of a Reasoning-to-Video (R2V) educational AI pipeline.
-Role: produce a rigorous, pedagogical, machine-usable reasoning trace from a student question.
-
-Hard constraints:
-1) Output ONLY valid JSON (UTF-8).
-2) Keep it concise and logical. Do not overcomplicate.
-3) CRITICAL FOR JSON VALIDITY: Properly escape all quotes.
-4) Maintain temporal coherence - each step must logically follow from previous steps.
-
-Required JSON schema:
-{
-  "subject": "Nom du concept",
-  "total_steps": 3,
-  "reasoning_chain":[
-    {
-      "step": 1,
-      "concept": "Nom de l'étape",
-      "logic": "Explication pédagogique",
-      "equations": "Formules si applicables"
-    }
-  ]
-}
-"""
-
-def _build_module_2_system_prompt() -> str:
-    return """You are Module-2 of a Reasoning-to-Video educational AI pipeline.
-Role: You are an expert Manim animator and a highly creative STEM teacher. Your task is to translate the provided reasoning chain into a dynamic Manim animation.
-
-CRITICAL HARD CONSTRAINTS FOR JSON VALIDITY AND ANIMATION:
-1) JSON ONLY: You MUST output EXACTLY ONE valid JSON object. No conversational text.
-2) NO LATEX: You are on Windows without LaTeX. NEVER use `MathTex` or `Tex`. Use ONLY `Text('''...''')` with triple single quotes to prevent escaping errors.
-3) NO OVERLAPPING TEXT: Before moving to a new step or clearing the whiteboard, you MUST wipe the screen using: `self.play(*[FadeOut(m) for m in self.mobjects])`
-4) DOMAIN-ADAPTIVE VISUALS (MANDATORY): You MUST draw geometric shapes or visual representations adapted to the specific subject! 
-   - For Mathematics: Use Polygon, Line, Angle, Graph.
-   - For Physics: Use Circle (for masses/planets), Arrow (for forces/vectors), Dot.
-   - For Computer Science: Use Rectangle (for memory/arrays), Text, Arrows (for pointers).
-   Do NOT just write text. You are an ANIMATOR.
-5) FIT ON SCREEN: Formulas or arrays must be scaled down using `.scale(0.65)`. Long text definitions must be split into multiple `Text` objects grouped with `VGroup().arrange(DOWN)`.
-6) LANGUAGE: All visible Text() and narration MUST be in French.
-
-Required JSON schema (Use this exact structural template, but REPLACE the bracketed placeholders [ ] with dynamic code adapted to the user's specific concept!):
-{
-  "narration": "Texte explicatif complet de la vidéo en français...",
-  "manim_code": "from manim import *\\n\\nclass PedagogicalScene(Scene):\\n    def construct(self):\\n        # ACT 1: TITLE\\n        t1 = Text('''[INSERT CONCEPT TITLE HERE]''', color=BLUE).to_edge(UP)\\n        self.play(Write(t1))\\n        self.wait(2)\\n        self.play(*[FadeOut(m) for m in self.mobjects])\\n\\n        # ACT 2: VISUALIZATION (ADAPT SHAPES TO DOMAIN)\\n        # [GENERATE MANIM SHAPES HERE: Circle, Rectangle, Arrow, etc. based on the concept]\\n        shape_example = Circle(color=WHITE) # Replace this with appropriate shapes\\n        label = Text('''[INSERT SHORT DEFINITION]''', color=GREEN).scale(0.6).next_to(shape_example, DOWN)\\n        self.play(Create(shape_example), Write(label))\\n        self.wait(3)\\n        self.play(*[FadeOut(m) for m in self.mobjects])\\n\\n        # ACT 3: FORMULA OR KEY RULE\\n        f1 = Text('''[INSERT FORMULA, ALGORITHM RULE OR CONCLUSION]''', color=YELLOW).scale(0.8)\\n        self.play(Write(f1))\\n        self.wait(3)"
-}
-"""
-
-# =============================================================================
 # FILE REGISTRATION UTILITIES
 # =============================================================================
 async def _register_video_in_openwebui(
@@ -132,7 +84,7 @@ async def _register_video_in_openwebui(
             hash=file_hash,
             filename=original_filename,
             path=str(video_path),
-            data={"source": "r2v_pipeline", "pipeline_version": "2.0.0"},
+            data={"source": "r2v_pipeline", "pipeline_version": "3.0.0-multi-agent"},
             meta={
                 "name": original_filename,
                 "content_type": "video/mp4",
@@ -166,6 +118,12 @@ async def generate_reasoning_video(
         config = get_r2v_config()
         llm_client: Optional[LLMClient] = None
         
+        # Initialisation des dossiers
+        video_filename = f"r2v_{request_id}.mp4"
+        video_path = UPLOAD_DIR / video_filename
+        temp_dir = config.temp_dir / request_id
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
         try:
             # ================================================================
             # STAGE 0: INITIALIZATION (ROUTAGE DYNAMIQUE)
@@ -173,14 +131,15 @@ async def generate_reasoning_video(
             yield _sse("progress", {
                 "request_id": request_id,
                 "stage": "init",
-                "progress_pct": 0,
-                "message": "🎬 Initialisation du pipeline Reasoning-to-Video...",
-                "detail": f"Préparation du modèle sélectionné : {payload.model_id}",
+                "progress_pct": 5,
+                "message": "🎬 Initialisation du Super-Pipeline Reasoning-to-Video...",
+                "detail": f"Préparation du modèle : {payload.model_id}",
             })
             
+            # Injection sécurisée des identifiants (Deep Copy)
             import copy
             local_llm_config = copy.deepcopy(config.llm)
-            local_llm_config.module1_model = payload.model_id
+            local_llm_config.module1_model = payload.model_id # Rétrocompatibilité 
             local_llm_config.module2_model = payload.model_id
             
             auth_header = request.headers.get("Authorization", "")
@@ -191,144 +150,102 @@ async def generate_reasoning_video(
             local_llm_config.api_key = user_token
             local_llm_config.base_url = internal_api_url
             
-            os.environ["OPENAI_API_KEY"] = local_llm_config.api_key
-            os.environ["OPENAI_BASE_URL"] = local_llm_config.base_url
+            # Injection dans l'environnement pour les agents MANIM autonomes
+            os.environ["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY", "")
             
+            if "OPENAI_BASE_URL" in os.environ:
+                del os.environ["OPENAI_BASE_URL"]
+                
+            os.environ["MODEL_NAME"] = os.getenv("MODEL_NAME", "gpt-4o")
+            
+            # llm_client peut être passé à l'orchestrateur si besoin
             llm_client = LLMClient(local_llm_config)
             
             yield _sse("progress", {
                 "request_id": request_id,
                 "stage": "init",
-                "progress_pct": 5,
-                "message": "✅ Services initialisés",
-                "detail": f"Modèle IA: {payload.model_id} | Moteur de rendu: Manim Local",
-            })
-
-            # ================================================================
-            # STAGE 1: MODULE 1 - REASONING EXTRACTION
-            # ================================================================
-            yield _sse("progress", {
-                "request_id": request_id,
-                "stage": "module_1_reasoning",
                 "progress_pct": 10,
-                "message": "🧠 Module 1 : Extraction du raisonnement logique...",
+                "message": "✅ Agents IA instanciés. Démarrage de la réflexion...",
+                "detail": "Mode: Multi-Agents + Rendu Neuro-Symbolique Manim Local",
             })
-            
-            try:
-                reasoning_json = await llm_client.generate_reasoning_chain(
-                    question=payload.question,
-                    system_prompt=_build_module_1_system_prompt(),
-                )
-                yield _sse("artifact", {"artifact_type": "reasoning_chain", "data": reasoning_json})
-            except Exception as e:
-                yield _sse("error", {"message": "❌ Erreur Extraction (Module 1)", "detail": str(e)})
-                yield "data: [DONE]\n\n"
-                return
-
-            await asyncio.sleep(1) # Protection API Limit
 
             # ================================================================
-            # STAGE 2: MODULE 2 - STORYBOARD STRUCTURATION
+            # STAGE 1: EXECUTION DU PIPELINE MANIM (THREAD ARRIÈRE-PLAN)
             # ================================================================
-            yield _sse("progress", {
-                "request_id": request_id,
-                "stage": "module_2_storyboard",
-                "progress_pct": 30,
-                "message": "🎬 Module 2 : Génération du code mathématique (IA)...",
-            })
             
-            try:
-                storyboard_json = await llm_client.generate_storyboard(
-                    reasoning_chain=reasoning_json,
-                    duration_sec=payload.duration_sec,
-                    system_prompt=_build_module_2_system_prompt(),
-                )
-                yield _sse("artifact", {"artifact_type": "storyboard", "data": storyboard_json})
-            except Exception as e:
-                yield _sse("error", {"message": "❌ Erreur Génération Code (Module 2)", "detail": str(e)})
-                yield "data: [DONE]\n\n"
-                return
-
-            # EXTRACTEUR BLINDÉ
-            manim_code = ""
-            if isinstance(storyboard_json, list) and len(storyboard_json) > 0:
-                storyboard_json = storyboard_json[0]
-
-            if isinstance(storyboard_json, dict):
-                manim_code = storyboard_json.get("manim_code", storyboard_json.get("code", storyboard_json.get("python_code", "")))
-
-            if not manim_code:
-                raw_response = str(storyboard_json)
-                match = re.search(r"(from\s+manim\s+import.*?)(?:```|$|'\s*})", raw_response, re.DOTALL)
-                if match:
-                    manim_code = match.group(1).replace('\\n', '\n')
-
-            if not manim_code or "class PedagogicalScene" not in manim_code:
-                raise ValueError(f"Code Manim invalide. Réponse brute : {str(storyboard_json)[:150]}...")
-
-            manim_code = textwrap.dedent(manim_code).strip()
-
-            # ================================================================
-            # STAGE 3: MODULE 3 - NEURO-SYMBOLIC RENDERING (MANIM)
-            # ================================================================
-            yield _sse("progress", {
-                "request_id": request_id,
-                "stage": "module_3_generation",
-                "progress_pct": 60,
-                "message": "📐 Génération de l'animation géométrique (Manim)...",
-            })
+            # 1. Instanciation de ton nouvel orchestrateur
+            orchestrator = ManimPipelineOrchestrator(
+                temp_dir=temp_dir, 
+                llm_client=llm_client
+            )
             
-            video_filename = f"r2v_{request_id}.mp4"
-            video_path = UPLOAD_DIR / video_filename
-            temp_dir = config.temp_dir / request_id
-            temp_dir.mkdir(parents=True, exist_ok=True)
+            # 2. Création d'une queue thread-safe pour la communication synchrone -> asynchrone
+            msg_queue = queue.Queue()
             
-            try:
-                temp_script_path = temp_dir / "temp_scene.py"
-                with open(temp_script_path, "w", encoding="utf-8") as f:
-                    f.write(manim_code)
-
-                # Exécution locale de Manim
-                result = subprocess.run([sys.executable, "-m", "manim", "-ql", "--media_dir", str(temp_dir), str(temp_script_path), "PedagogicalScene"],
-                    capture_output=True, text=True
-                )
-                
-                if result.returncode != 0:
-                    raise RuntimeError(f"Planté !\nLog:\n{result.stderr}")
-
-                mp4_files = list(temp_dir.rglob("*.mp4"))
-                if not mp4_files:
-                    raise FileNotFoundError(f"Vidéo introuvable. Logs:\n{result.stdout}")
-
-                shutil.copy(mp4_files[0], video_path)
-
+            def sse_callback(progress: int, message: str):
+                """Fonction passée à l'orchestrateur pour qu'il pousse ses logs ici."""
+                msg_queue.put({"progress_pct": progress, "message": message})
+            
+            # 3. Exécution de la tâche lourde dans un thread séparé
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(
+                None, 
+                orchestrator.run_pipeline, 
+                payload.question, 
+                sse_callback
+            )
+            
+            # 4. Lecture de la queue en temps réel pour envoyer les SSE au frontend SvelteKit
+            while not task.done():
+                while not msg_queue.empty():
+                    msg = msg_queue.get()
+                    yield _sse("progress", {
+                        "request_id": request_id,
+                        "stage": "manim_pipeline",
+                        "progress_pct": msg["progress_pct"],
+                        "message": msg["message"]
+                    })
+                # Pause légère pour ne pas saturer le thread async
+                await asyncio.sleep(0.5)
+            
+            # 5. Vider les derniers messages restants dans la queue une fois la tâche terminée
+            while not msg_queue.empty():
+                msg = msg_queue.get()
                 yield _sse("progress", {
                     "request_id": request_id,
-                    "progress_pct": 88,
-                    "message": "✅ Rendu visuel terminé avec succès",
+                    "stage": "manim_pipeline",
+                    "progress_pct": msg["progress_pct"],
+                    "message": msg["message"]
                 })
+            
+            # 6. Récupération du résultat (Lève une exception si l'orchestrateur a planté)
+            generated_video_filepath = task.result()
+            
+            if not generated_video_filepath or not os.path.exists(generated_video_filepath):
+                raise FileNotFoundError("L'orchestrateur a terminé mais n'a retourné aucun fichier vidéo valide.")
 
-            except Exception as e:
-                yield _sse("error", {"message": f"❌ ERREUR FATALE MANIM : {str(e)}"})
-                raise e
+            # Copier la vidéo finale vers le dossier UPLOAD_DIR public d'OpenWebUI
+            shutil.copy(generated_video_filepath, video_path)
 
             # ================================================================
-            # STAGE 4: FILE REGISTRATION & FINALIZATION
+            # STAGE 2: FILE REGISTRATION & FINALIZATION
             # ================================================================
-            yield _sse("progress", {"progress_pct": 95, "message": "📁 Enregistrement du fichier vidéo..."})
+            yield _sse("progress", {"progress_pct": 95, "message": "📁 Enregistrement du fichier vidéo sécurisé..."})
             
             file_id = await _register_video_in_openwebui(
                 user_id=user_id, video_path=video_path, video_filename=video_filename,
-                original_filename=f"R2V_Video.mp4", chat_id=payload.chat_id,
+                original_filename=f"R2V_Video_Advanced.mp4", chat_id=payload.chat_id,
             )
             file_id = file_id or request_id
             
+            # Markdown rendu de façon sécurisée par le parseur de SvelteKit
             final_markdown = (
-                f"### Vidéo Explicative Générée\n\n"
+                f"### 🎥 Vidéo Explicative Générée\n\n"
                 f"{{{{VIDEO_FILE_ID_{file_id}}}}}\n\n"
                 f"---\n\n"
-                f"**Moteur de Rendu :** Neuro-Symbolique (Manim)\n"
-                f"**Modèle Utilisé :** `{payload.model_id}`\n"
+                f"**🧠 Moteur de Raisonnement :** Pipeline Multi-Agents\n"
+                f"**📐 Moteur de Rendu :** Neuro-Symbolique (Manim)\n"
+                f"**🤖 Modèle Utilisé :** `{payload.model_id}`\n"
             )
             
             yield _sse("final", {
@@ -349,7 +266,7 @@ async def generate_reasoning_video(
         finally:
             if llm_client:
                 await llm_client.close()
-            # Nettoyage des fichiers temporaires pour économiser le disque
+            # Nettoyage strict des fichiers temporaires (Scripts générés, frames RAG)
             if 'temp_dir' in locals() and temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -367,7 +284,8 @@ async def r2v_health_check():
     return {
         "status": "healthy",
         "service": "r2v_pipeline",
-        "mode": "neuro-symbolic (manim)",
+        "architecture": "multi-agent + manim_orchestrator",
+        "mode": "neuro-symbolic",
     }
 
 @router.get("/config")
@@ -375,5 +293,5 @@ async def get_r2v_configuration(user=Depends(get_verified_user)):
     config = get_r2v_config()
     return {
         "llm_provider": config.llm.provider,
-        "engine": "manim local"
+        "engine": "manim advanced orchestrator"
     }

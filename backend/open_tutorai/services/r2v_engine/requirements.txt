@@ -1,0 +1,15 @@
+google-generativeai>=0.8.5
+openai>=1.0.0
+python-dotenv>=0.21.0
+manim>=0.18.0
+manim-voiceover>=0.3.7
+gtts==2.5.1
+moviepy==1.0.3
+
+# RAG System for Manim Documentation (modern packages)
+langchain-core>=1.0.0
+langchain-chroma>=1.0.0
+langchain-huggingface>=1.0.0
+langchain-text-splitters>=0.3.0
+chromadb>=1.0.0
+sentence-transformers>=2.2.0

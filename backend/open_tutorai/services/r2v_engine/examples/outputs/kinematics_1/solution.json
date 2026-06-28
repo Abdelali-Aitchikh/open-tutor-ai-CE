@@ -1,0 +1,16 @@
+[
+  {
+    "approach": "This problem involves uniform acceleration. We can use the equations of motion for constant acceleration to find the acceleration and distance covered.",
+    "equation": "1. v = u + at  (where v = final velocity, u = initial velocity, a = acceleration, t = time)\n2. s = ut + (1/2)at\u00b2 (where s = distance, u = initial velocity, a = acceleration, t = time)",
+    "calculation": "Given: u = 0 m/s (starts from rest), v = 20 m/s, t = 10 s\nUsing the first equation:\n20 = 0 + a(10)\na = 20/10 = 2 m/s\u00b2",
+    "explanation": "We use the first equation of motion because we have information about initial and final velocity along with the time it took for the change in velocity. This allows us to directly calculate the acceleration.\nVisualization: Imagine a car starting from rest and steadily increasing its speed. Visualize a graph of velocity versus time as a straight line with a positive slope (the acceleration).",
+    "visualization": "Imagine a car starting from rest and steadily increasing its speed. Visualize a graph of velocity versus time as a straight line with a positive slope (the acceleration)."
+  },
+  {
+    "approach": "Now that we have the acceleration, we can find the distance covered using the second equation of motion.",
+    "equation": "s = ut + (1/2)at\u00b2",
+    "calculation": "s = (0)(10) + (1/2)(2)(10)\u00b2\ns = 0 + (1)(100)\ns = 100 m",
+    "explanation": "We now use the calculated acceleration and the initial conditions along with equation of motion to calculate the displacement. Since the acceleration is uniform, we can easily compute the distance travelled.\nVisualization: Visualize the area under the velocity-time graph calculated earlier. The area represents the displacement of the car.",
+    "visualization": "Visualize the area under the velocity-time graph calculated earlier. The area represents the displacement of the car."
+  }
+]
